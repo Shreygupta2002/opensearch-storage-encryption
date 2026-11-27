@@ -10,6 +10,7 @@ import static org.opensearch.index.store.bufferpoolfs.StaticConfigs.CACHE_BLOCK_
 import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Path;
 
 import org.apache.lucene.store.AlreadyClosedException;
@@ -18,6 +19,7 @@ import org.apache.lucene.store.RandomAccessInput;
 import org.opensearch.index.store.block.RefCountedByteBuffer;
 import org.opensearch.index.store.block_cache.BlockCache;
 import org.opensearch.index.store.block_cache.BlockCacheValue;
+import org.opensearch.index.store.block_cache.FileBlockCacheKey;
 import org.opensearch.index.store.read_ahead.ReadaheadContext;
 import org.opensearch.index.store.read_ahead.ReadaheadManager;
 
@@ -39,6 +41,8 @@ public class CachedByteBufferIndexInput extends IndexInput implements RandomAcce
     final ReadaheadContext readaheadContext;
     final long absoluteBaseOffset;
     final boolean isSlice;
+    /** Opened with {@code IOContext.READONCE}: its reads leave the cache unchanged, like a merge's. */
+    final boolean readOnce;
 
     long curPosition = 0L;
     volatile boolean isOpen = true;
@@ -54,6 +58,23 @@ public class CachedByteBufferIndexInput extends IndexInput implements RandomAcce
     private final BlockSlotTinyCache<RefCountedByteBuffer> slotCache;
     private final BlockSlotTinyCache.CacheHitHolder cacheHitHolder = new BlockSlotTinyCache.CacheHitHolder();
 
+    /*
+     * Reads outside the cache, by a merge or read-once input (see MergeCachePolicy), go into this input's own
+     * decrypted chunks. A read that continues where a chunk ends doubles that chunk's next read, from
+     * UNCACHED_MIN_READ_BYTES up to UNCACHED_MAX_READ_BYTES; any other read starts small again, so a clone or
+     * a reader that jumps around reads little more than the blocks it uses. Two chunks, so that a reader
+     * alternating between two parts of the file doesn't reread them.
+     */
+    static final int UNCACHED_MIN_READ_BYTES = 16 << 10;
+    static final int UNCACHED_MAX_READ_BYTES = 256 << 10;
+    private final byte[][] chunkData = new byte[2][];
+    private final long[] chunkStart = { -1, -1 };
+    private final int[] chunkLength = new int[2];
+    private final int[] chunkNextRead = new int[2];
+    private int lastChunk;
+    /** The current block when it was read outside the cache (then {@link #currentBlock} is null). */
+    private ByteBuffer currentUncachedBlock;
+
     public static CachedByteBufferIndexInput newInstance(
         String resourceDescription,
         Path path,
@@ -62,6 +83,20 @@ public class CachedByteBufferIndexInput extends IndexInput implements RandomAcce
         ReadaheadManager readaheadManager,
         ReadaheadContext readaheadContext,
         BlockSlotTinyCache<RefCountedByteBuffer> slotCache
+    ) {
+        return newInstance(resourceDescription, path, length, blockCache, readaheadManager, readaheadContext, slotCache, false);
+    }
+
+    /** As above; a {@code readOnce} input's reads leave the cache unchanged (see {@link MergeCachePolicy}). */
+    public static CachedByteBufferIndexInput newInstance(
+        String resourceDescription,
+        Path path,
+        long length,
+        BlockCache<RefCountedByteBuffer> blockCache,
+        ReadaheadManager readaheadManager,
+        ReadaheadContext readaheadContext,
+        BlockSlotTinyCache<RefCountedByteBuffer> slotCache,
+        boolean readOnce
     ) {
         CachedByteBufferIndexInput input = new CachedByteBufferIndexInput(
             resourceDescription,
@@ -72,7 +107,8 @@ public class CachedByteBufferIndexInput extends IndexInput implements RandomAcce
             readaheadManager,
             readaheadContext,
             false,
-            slotCache
+            slotCache,
+            readOnce
         );
         try {
             input.seek(0L);
@@ -91,9 +127,11 @@ public class CachedByteBufferIndexInput extends IndexInput implements RandomAcce
         ReadaheadManager readaheadManager,
         ReadaheadContext readaheadContext,
         boolean isSlice,
-        BlockSlotTinyCache<RefCountedByteBuffer> slotCache
+        BlockSlotTinyCache<RefCountedByteBuffer> slotCache,
+        boolean readOnce
     ) {
         super(resourceDescription);
+        this.readOnce = readOnce;
         this.path = path;
         this.absoluteBaseOffset = absoluteBaseOffset;
         this.length = length;
@@ -125,14 +163,25 @@ public class CachedByteBufferIndexInput extends IndexInput implements RandomAcce
         final long blockOffset = fileOffset & ~CACHE_BLOCK_MASK;
         final int offsetInBlock = (int) (fileOffset - blockOffset);
 
-        if (blockOffset == currentBlockOffset && currentBlock != null) {
-            final ByteBuffer buffer = currentBlock.value().buffer();
-            if (buffer != null) {
+        if (blockOffset == currentBlockOffset) {
+            if (currentUncachedBlock != null) {
                 lastOffsetInBlock = offsetInBlock;
-                return buffer;
+                return currentUncachedBlock;
             }
-            // The cache has dropped this block since the last read (its buffer is cleared): look it up again.
+            if (currentBlock != null) {
+                final ByteBuffer buffer = currentBlock.value().buffer();
+                if (buffer != null) {
+                    lastOffsetInBlock = offsetInBlock;
+                    return buffer;
+                }
+                // The cache has dropped this block since the last read (its buffer is cleared): look it up again.
+            }
         }
+
+        if (MergeCachePolicy.bypassReads(readOnce) && blockCache.supportsUncachedReads()) {
+            return getBlockLeavingCacheUnchanged(blockOffset, offsetInBlock);
+        }
+        currentUncachedBlock = null;
 
         BlockCacheValue<RefCountedByteBuffer> cacheValue;
         ByteBuffer buffer;
@@ -160,6 +209,82 @@ public class CachedByteBufferIndexInput extends IndexInput implements RandomAcce
 
         lastOffsetInBlock = offsetInBlock;
         return buffer;
+    }
+
+    /**
+     * Returns the block at {@code blockOffset} without changing the cache: a cached copy if there is one,
+     * otherwise this input's own decrypted copy. Used for merges and read-once inputs, which read each block
+     * once (see {@link MergeCachePolicy}).
+     */
+    private ByteBuffer getBlockLeavingCacheUnchanged(long blockOffset, int offsetInBlock) throws IOException {
+        int slot = chunkHolding(blockOffset);
+        if (slot < 0) {
+            final BlockCacheValue<RefCountedByteBuffer> cached = blockCache.peek(new FileBlockCacheKey(path, blockOffset));
+            final ByteBuffer cachedBuffer = cached != null ? cached.value().buffer() : null;
+            if (cachedBuffer != null) {
+                MergeCachePolicy.onReadFromCache();
+                currentUncachedBlock = null;
+                currentBlockOffset = blockOffset;
+                currentBlock = cached;
+                currentBlockLength = cached.length();
+                lastOffsetInBlock = offsetInBlock;
+                return cachedBuffer;
+            }
+            slot = fillChunk(blockOffset);
+        }
+        lastChunk = slot;
+        final int indexInChunk = (int) (blockOffset - chunkStart[slot]);
+        final int blockLength = Math.min(CACHE_BLOCK_SIZE, chunkLength[slot] - indexInChunk);
+        currentUncachedBlock = ByteBuffer.wrap(chunkData[slot], indexInChunk, blockLength).slice().order(ByteOrder.LITTLE_ENDIAN);
+        currentBlock = null;
+        currentBlockOffset = blockOffset;
+        currentBlockLength = blockLength;
+        lastOffsetInBlock = offsetInBlock;
+        return currentUncachedBlock;
+    }
+
+    /** The chunk holding {@code blockOffset}, or -1. */
+    private int chunkHolding(long blockOffset) {
+        for (int i = 0; i < 2; i++) {
+            final int s = i == 0 ? lastChunk : 1 - lastChunk;
+            if (chunkStart[s] >= 0 && blockOffset >= chunkStart[s] && blockOffset < chunkStart[s] + chunkLength[s]) {
+                return s;
+            }
+        }
+        return -1;
+    }
+
+    /** Reads the chunk starting at {@code blockOffset} and returns its slot. */
+    private int fillChunk(long blockOffset) throws IOException {
+        int slot = -1;
+        int size = UNCACHED_MIN_READ_BYTES;
+        for (int i = 0; i < 2; i++) {
+            final int s = i == 0 ? lastChunk : 1 - lastChunk;
+            if (chunkStart[s] >= 0 && blockOffset == chunkStart[s] + chunkLength[s]) {
+                slot = s; // continues this chunk: read more at once
+                size = chunkNextRead[s];
+                break;
+            }
+        }
+        if (slot < 0) {
+            slot = 1 - lastChunk; // a jump: replace the chunk used less recently, and start small
+        }
+        // Read up to the end of this input's last block at most; the file may be longer (a slice) or end sooner.
+        final long end = (absoluteBaseOffset + length + CACHE_BLOCK_MASK) & ~CACHE_BLOCK_MASK;
+        final int toRead = (int) Math.min(size, end - blockOffset);
+        if (chunkData[slot] == null || chunkData[slot].length < toRead) {
+            chunkData[slot] = new byte[toRead];
+        }
+        chunkStart[slot] = -1;
+        final int read = blockCache.readUncached(path, blockOffset, chunkData[slot], 0, toRead);
+        if (read <= 0) {
+            throw new EOFException("No data at offset " + blockOffset + ": " + this);
+        }
+        MergeCachePolicy.onUncachedRead(read);
+        chunkStart[slot] = blockOffset;
+        chunkLength[slot] = read;
+        chunkNextRead[slot] = Math.min(UNCACHED_MAX_READ_BYTES, Math.max(UNCACHED_MIN_READ_BYTES, size * 2));
+        return slot;
     }
 
     @Override
@@ -488,7 +613,8 @@ public class CachedByteBufferIndexInput extends IndexInput implements RandomAcce
             readaheadManager,
             readaheadContext,
             true,
-            slotCache
+            slotCache,
+            readOnce
         );
         try {
             slice.seek(0L);
@@ -504,6 +630,8 @@ public class CachedByteBufferIndexInput extends IndexInput implements RandomAcce
             return;
         isOpen = false;
         currentBlock = null;
+        currentUncachedBlock = null;
+        chunkData[0] = chunkData[1] = null;
         currentBlockOffset = -1;
 
         if (!isSlice) {

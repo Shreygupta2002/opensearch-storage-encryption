@@ -126,6 +126,17 @@ public interface BlockLoader<T> {
     }
 
     /**
+     * Reads and decrypts {@code length} bytes (a multiple of the block size) from block-aligned
+     * {@code startOffset} into {@code dst}, without pool buffers or the block cache.
+     *
+     * @return the number of bytes copied, fewer than {@code length} only at the end of the file
+     * @throws UnsupportedOperationException if this loader can't read outside the cache
+     */
+    default int readDecrypted(Path filePath, long startOffset, byte[] dst, int dstOffset, int length) throws IOException {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " has no uncached reads");
+    }
+
+    /**
      * Loads a single block using the provided cache key.
      *
      * @param key the cache key identifying the block to load

@@ -144,6 +144,7 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
                 CryptoDirectoryFactory.NODE_KEY_REFRESH_INTERVAL_SETTING,
                 CryptoDirectoryFactory.NODE_KEY_EXPIRY_INTERVAL_SETTING,
                 CryptoDirectoryFactory.WRITE_CACHE_ENABLED_SETTING,
+                CryptoDirectoryFactory.MERGE_CACHE_BYPASS_ENABLED_SETTING,
                 CryptoDirectoryFactory.BYTE_BUFFER_MODE_ENABLED,
                 CryptoDirectoryFactory.BYTE_BUFFER_SLAB_POOL_ENABLED,
                 PoolSizeCalculator.NODE_POOL_SIZE_PERCENTAGE_SETTING,

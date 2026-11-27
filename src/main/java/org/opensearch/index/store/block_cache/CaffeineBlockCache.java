@@ -16,6 +16,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.index.store.block_loader.BlockLoader;
+import org.opensearch.index.store.block_loader.CryptoDirectIOBlockLoader;
 import org.opensearch.index.store.metrics.CryptoMetricsService;
 
 import com.github.benmanes.caffeine.cache.Cache;
@@ -39,22 +40,47 @@ public final class CaffeineBlockCache<T, V> implements BlockCache<T> {
 
     private final Cache<BlockCacheKey, BlockCacheValue<T>> cache;
     private final BlockLoader<V> blockLoader;
+    private final long maxBlocks;
 
     /**
      * Constructs a new CaffeineBlockCache with the specified cache and block loader.
      *
      * @param cache the underlying Caffeine cache instance
      * @param blockLoader the loader used to load blocks when cache misses occur
-     * @param maxBlocks the maximum number of blocks to cache (currently unused but kept for API compatibility)
+     * @param maxBlocks the maximum number of blocks the shared cache holds, used to size large-write limits
      */
     public CaffeineBlockCache(Cache<BlockCacheKey, BlockCacheValue<T>> cache, BlockLoader<V> blockLoader, long maxBlocks) {
         this.blockLoader = blockLoader;
         this.cache = cache;
+        this.maxBlocks = maxBlocks;
     }
 
     @Override
     public BlockCacheValue<T> get(BlockCacheKey key) {
         return cache.getIfPresent(key);
+    }
+
+    @Override
+    public BlockCacheValue<T> peek(BlockCacheKey key) {
+        return cache.policy().getIfPresentQuietly(key);
+    }
+
+    @Override
+    public int readUncached(Path filePath, long offset, byte[] dst, int dstOffset, int length) throws IOException {
+        if (blockLoader == null) {
+            throw new UnsupportedOperationException("CaffeineBlockCache without a loader has no uncached reads");
+        }
+        return blockLoader.readDecrypted(filePath, offset, dst, dstOffset, length);
+    }
+
+    @Override
+    public boolean supportsUncachedReads() {
+        return blockLoader instanceof CryptoDirectIOBlockLoader;
+    }
+
+    @Override
+    public long maxBlocks() {
+        return maxBlocks > 0 ? maxBlocks : -1;
     }
 
     /**

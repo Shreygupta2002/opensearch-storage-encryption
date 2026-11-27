@@ -12,6 +12,7 @@ import static org.opensearch.index.store.bufferpoolfs.StaticConfigs.CACHE_BLOCK_
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -114,29 +115,7 @@ public class CryptoDirectIOBlockLoader<T extends BlockCacheValue<T>> implements 
             MemorySegment readBytes = directIOReadAligned(ref.channel(), filePath, startOffset, readLength, arena);
             long bytesRead = readBytes.byteSize();
 
-            byte[] masterKey = keyResolver.getDataKey().getEncoded();
-
-            // Get footer from disk and load metadata (footer + derived key) atomically into cache
-            EncryptionFooter footer = readFooterFromDisk(normalizedPath, filePath, masterKey);
-
-            // Get or create metadata atomically - ensures footer and key are always consistent
-            var metadata = encryptionMetadataCache.getOrLoadMetadata(normalizedPath, footer, masterKey);
-            byte[] messageId = metadata.getFooter().getMessageId();
-            byte[] fileKey = metadata.getFileKey();
-
-            // Use frame-based decryption with derived file key
-            MemorySegmentDecryptor
-                .decryptInPlaceFrameBased(
-                    readBytes.address(),
-                    readBytes.byteSize(),
-                    fileKey,
-                    masterKey,
-                    messageId,
-                    EncryptionMetadataTrailer.DEFAULT_FRAME_SIZE,
-                    startOffset,
-                    normalizedPath,
-                    encryptionMetadataCache
-                );
+            decryptInPlace(readBytes, filePath, normalizedPath, startOffset);
 
             if (bytesRead == 0) {
                 throw new java.io.EOFException("Unexpected EOF or empty read at offset " + startOffset + " for file " + filePath);
@@ -202,6 +181,64 @@ public class CryptoDirectIOBlockLoader<T extends BlockCacheValue<T>> implements 
             LOGGER.error("Bulk read failed: path={} offset={} length={} err={}", filePath, startOffset, readLength, e.toString());
             throw e;
         }
+    }
+
+    /**
+     * Reads and decrypts {@code length} bytes from block-aligned {@code startOffset} straight into {@code dst}.
+     * It takes no pool buffer and doesn't touch the block cache, so a one-pass reader such as a merge doesn't
+     * fill the cache with blocks nothing reads again.
+     */
+    @Override
+    public int readDecrypted(Path filePath, long startOffset, byte[] dst, int dstOffset, int length) throws IOException {
+        if ((startOffset & CACHE_BLOCK_MASK) != 0) {
+            throw new IllegalArgumentException("startOffset must be block-aligned: " + startOffset);
+        }
+        if (length <= 0 || (length & CACHE_BLOCK_MASK) != 0) {
+            throw new IllegalArgumentException("length must be a positive multiple of the block size: " + length);
+        }
+        String normalizedPath = filePath.toAbsolutePath().normalize().toString();
+        try (Arena arena = Arena.ofConfined(); RefCountedChannel ref = fileChannelCache.acquire(normalizedPath)) {
+            MemorySegment readBytes = directIOReadAligned(ref.channel(), filePath, startOffset, length, arena);
+            if (readBytes.byteSize() == 0) {
+                throw new java.io.EOFException("Unexpected EOF or empty read at offset " + startOffset + " for file " + filePath);
+            }
+            decryptInPlace(readBytes, filePath, normalizedPath, startOffset);
+            int copied = (int) Math.min(readBytes.byteSize(), length);
+            MemorySegment.copy(readBytes, ValueLayout.JAVA_BYTE, 0, dst, dstOffset, copied);
+            return copied;
+        } catch (NoSuchFileException e) {
+            throw e;
+        } catch (Exception e) {
+            LOGGER.error("Uncached read failed: path={} offset={} length={} err={}", filePath, startOffset, length, e.toString());
+            throw e instanceof IOException ioe ? ioe : new IOException("Uncached read failed for " + filePath, e);
+        }
+    }
+
+    /** Decrypts {@code readBytes}, read from the file at {@code startOffset}, in place. */
+    private void decryptInPlace(MemorySegment readBytes, Path filePath, String normalizedPath, long startOffset) throws Exception {
+        byte[] masterKey = keyResolver.getDataKey().getEncoded();
+
+        // Get footer from disk and load metadata (footer + derived key) atomically into cache
+        EncryptionFooter footer = readFooterFromDisk(normalizedPath, filePath, masterKey);
+
+        // Get or create metadata atomically - ensures footer and key are always consistent
+        var metadata = encryptionMetadataCache.getOrLoadMetadata(normalizedPath, footer, masterKey);
+        byte[] messageId = metadata.getFooter().getMessageId();
+        byte[] fileKey = metadata.getFileKey();
+
+        // Use frame-based decryption with derived file key
+        MemorySegmentDecryptor
+            .decryptInPlaceFrameBased(
+                readBytes.address(),
+                readBytes.byteSize(),
+                fileKey,
+                masterKey,
+                messageId,
+                EncryptionMetadataTrailer.DEFAULT_FRAME_SIZE,
+                startOffset,
+                normalizedPath,
+                encryptionMetadataCache
+            );
     }
 
     /**

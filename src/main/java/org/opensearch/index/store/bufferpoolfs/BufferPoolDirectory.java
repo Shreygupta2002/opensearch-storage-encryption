@@ -79,6 +79,8 @@ public class BufferPoolDirectory extends FSDirectory {
     private final byte[] masterKeyBytes;
     private final EncryptionMetadataCache encryptionMetadataCache;
     private final FileChannelCache fileChannelCache;
+    /** Merges at least this big, and file bytes past it, aren't write-cached (see {@link MergeCachePolicy}). */
+    private final long largeWriteBytes;
 
     /**
      * Creates a new BufferPoolDirectory with the specified components.
@@ -117,6 +119,7 @@ public class BufferPoolDirectory extends FSDirectory {
         this.masterKeyBytes = keyResolver.getDataKey().getEncoded();
         this.encryptionMetadataCache = encryptionMetadataCache;
         this.fileChannelCache = fileChannelCache;
+        this.largeWriteBytes = MergeCachePolicy.largeWriteBytes(blockCache != null ? blockCache.maxBlocks() : -1);
 
         // startCacheStatsTelemetry(); // uncomment for local testing
     }
@@ -151,7 +154,8 @@ public class BufferPoolDirectory extends FSDirectory {
                         bbCache,
                         readAheadManager,
                         readAheadContext,
-                        slotCache
+                        slotCache,
+                        context == IOContext.READONCE
                     );
             } else {
                 @SuppressWarnings("unchecked")
@@ -185,7 +189,7 @@ public class BufferPoolDirectory extends FSDirectory {
             Path path = directory.resolve(name);
             OutputStream fos = Files.newOutputStream(path, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
 
-            return createBufferIOWithCaching(name, path, fos);
+            return createBufferIOWithCaching(name, path, fos, context);
         } catch (Exception e) {
             CryptoMetricsService.getInstance().recordError(ErrorType.INDEX_OUTPUT_ERROR);
             throw e;
@@ -203,7 +207,7 @@ public class BufferPoolDirectory extends FSDirectory {
         Path path = directory.resolve(name);
         OutputStream fos = Files.newOutputStream(path, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
 
-        return createBufferIOWithCaching(name, path, fos);
+        return createBufferIOWithCaching(name, path, fos, context);
     }
 
     /**
@@ -211,7 +215,8 @@ public class BufferPoolDirectory extends FSDirectory {
      * same pool the read path uses: MemorySegments by default, ByteBuffers (e.g. slab slots) in ByteBuffer mode.
      */
     @SuppressWarnings("unchecked")
-    private IndexOutput createBufferIOWithCaching(String name, Path path, OutputStream fos) throws IOException {
+    private IndexOutput createBufferIOWithCaching(String name, Path path, OutputStream fos, IOContext context) throws IOException {
+        final long writeCacheLimit = MergeCachePolicy.writeCacheLimit(context, largeWriteBytes);
         if (byteBufferModeEnabled) {
             return new BufferIOWithCaching(
                 name,
@@ -221,7 +226,8 @@ public class BufferPoolDirectory extends FSDirectory {
                 (BlockCache<RefCountedByteBuffer>) (BlockCache<?>) blockCache,
                 (Pool<RefCountedByteBuffer>) pool,
                 this.provider,
-                this.encryptionMetadataCache
+                this.encryptionMetadataCache,
+                writeCacheLimit
             );
         }
         return new BufferIOWithCaching(
@@ -232,7 +238,8 @@ public class BufferPoolDirectory extends FSDirectory {
             (Pool<RefCountedMemorySegment>) pool,
             (BlockCache<RefCountedMemorySegment>) (BlockCache<?>) blockCache,
             this.provider,
-            this.encryptionMetadataCache
+            this.encryptionMetadataCache,
+            writeCacheLimit
         );
     }
 
