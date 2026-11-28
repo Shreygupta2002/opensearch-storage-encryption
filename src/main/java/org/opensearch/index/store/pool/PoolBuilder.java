@@ -20,6 +20,7 @@ import org.opensearch.index.store.block_cache.BlockCache;
 import org.opensearch.index.store.block_cache.BlockCacheBuilder;
 import org.opensearch.index.store.block_loader.DirectIOReaderUtil;
 import org.opensearch.index.store.block_loader.FileChannelCache;
+import org.opensearch.index.store.bufferpoolfs.MergeCachePolicy;
 import org.opensearch.index.store.read_ahead.Worker;
 import org.opensearch.index.store.read_ahead.impl.QueuingWorker;
 import org.opensearch.index.store.read_ahead.impl.ReadAheadSizingPolicy;
@@ -268,8 +269,8 @@ public final class PoolBuilder {
                         "MemoryTracker["
                             + "cache_entries={}, cache_max={}, cache_bytes={}MB, cache_max_bytes={}MB, "
                             + "direct_memory={}MB, zombie={}MB, "
-                            + "orphaned_buffers={}, "
-                            + "pool={}]",
+                            + "orphaned_buffers={}, cache_hits={}, cache_misses={}, "
+                            + "pool={}, {}]",
                         cacheEntries,
                         cacheMaxBlocks,
                         cacheBytes / (1024 * 1024),
@@ -277,7 +278,10 @@ public final class PoolBuilder {
                         directMemoryUsed / (1024 * 1024),
                         zombieBytes / (1024 * 1024),
                         orphanedBuffers,
-                        pool != null ? pool.poolStats() : "null"
+                        blockCache.hitCount(),
+                        blockCache.missCount(),
+                        pool != null ? pool.poolStats() : "null",
+                        MergeCachePolicy.stats()
                     );
 
                 /*

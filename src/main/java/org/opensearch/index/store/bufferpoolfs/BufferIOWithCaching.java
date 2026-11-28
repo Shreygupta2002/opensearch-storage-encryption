@@ -80,10 +80,39 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
         EncryptionMetadataCache encryptionMetadataCache
     )
         throws IOException {
+        this(name, path, os, key, memorySegmentPool, blockCache, provider, encryptionMetadataCache, Long.MAX_VALUE);
+    }
+
+    /**
+     * MemorySegment mode, write-caching only blocks that start before {@code writeCacheLimitBytes}: 0 caches
+     * nothing (a large merge's output), {@code Long.MAX_VALUE} caches the whole file.
+     */
+    public BufferIOWithCaching(
+        String name,
+        Path path,
+        OutputStream os,
+        byte[] key,
+        Pool<RefCountedMemorySegment> memorySegmentPool,
+        BlockCache<RefCountedMemorySegment> blockCache,
+        Provider provider,
+        EncryptionMetadataCache encryptionMetadataCache,
+        long writeCacheLimitBytes
+    )
+        throws IOException {
         super(
             "FSIndexOutput(path=\"" + path + "\")",
             name,
-            new EncryptedOutputStream(os, path, key, memorySegmentPool, null, blockCache, provider, encryptionMetadataCache),
+            new EncryptedOutputStream(
+                os,
+                path,
+                key,
+                memorySegmentPool,
+                null,
+                blockCache,
+                provider,
+                encryptionMetadataCache,
+                writeCacheLimitBytes
+            ),
             CHUNK_SIZE
         );
     }
@@ -100,10 +129,36 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
         EncryptionMetadataCache encryptionMetadataCache
     )
         throws IOException {
+        this(name, path, os, key, blockCache, byteBufferPool, provider, encryptionMetadataCache, Long.MAX_VALUE);
+    }
+
+    /** ByteBuffer mode, write-caching only blocks that start before {@code writeCacheLimitBytes}. */
+    public BufferIOWithCaching(
+        String name,
+        Path path,
+        OutputStream os,
+        byte[] key,
+        BlockCache<RefCountedByteBuffer> blockCache,
+        Pool<RefCountedByteBuffer> byteBufferPool,
+        Provider provider,
+        EncryptionMetadataCache encryptionMetadataCache,
+        long writeCacheLimitBytes
+    )
+        throws IOException {
         super(
             "FSIndexOutput(path=\"" + path + "\")",
             name,
-            new EncryptedOutputStream(os, path, key, null, byteBufferPool, blockCache, provider, encryptionMetadataCache),
+            new EncryptedOutputStream(
+                os,
+                path,
+                key,
+                null,
+                byteBufferPool,
+                blockCache,
+                provider,
+                encryptionMetadataCache,
+                writeCacheLimitBytes
+            ),
             CHUNK_SIZE
         );
     }
@@ -125,6 +180,8 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
         private final BlockCache blockCache;
         private final long frameSize;
         private final long frameSizeMask;
+        /** Only blocks starting before this offset are write-cached (see {@link MergeCachePolicy}). */
+        private final long writeCacheLimitBytes;
 
         private final EncryptionAlgorithm algorithm;
         private final Provider provider;
@@ -152,9 +209,11 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
             Pool<RefCountedByteBuffer> byteBufferPool,
             BlockCache<?> blockCache,
             Provider provider,
-            EncryptionMetadataCache encryptionMetadataCache
+            EncryptionMetadataCache encryptionMetadataCache,
+            long writeCacheLimitBytes
         ) {
             super(os);
+            this.writeCacheLimitBytes = writeCacheLimitBytes;
             this.path = path;
             this.normalizedPath = EncryptionMetadataCache.normalizePath(path);
             this.masterKey = key;
@@ -290,6 +349,12 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
             if (!CryptoDirectoryFactory.isWriteCacheEnabled() || (memorySegmentPool == null && byteBufferPool == null)) {
                 return;
             }
+            if (blockAlignedOffset >= writeCacheLimitBytes) {
+                if (blockOffset == 0) {
+                    MergeCachePolicy.onWriteBlockNotCached();
+                }
+                return;
+            }
 
             // Cache fully-aligned full blocks immediately
             if (blockOffset == 0 && chunkLen == CACHE_BLOCK_SIZE) {
@@ -416,6 +481,10 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
                 return;
             }
             if (partialBlockLength == 0 || lastCachedBlockOffset < 0 || streamOffset <= 0) {
+                return;
+            }
+            if (((streamOffset - 1) & ~CACHE_BLOCK_MASK) >= writeCacheLimitBytes) {
+                // Past the write-cache limit: the tail wasn't tracked, so there's nothing to cache.
                 return;
             }
 

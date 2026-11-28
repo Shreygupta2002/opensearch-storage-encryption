@@ -83,6 +83,14 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         .boolSetting("node.store.crypto.write_cache_enabled", true, Property.NodeScope, Property.Dynamic);
 
     /**
+     * Keep merge reads, read-once inputs and large writes (such as a force merge's output) out of the block
+     * cache, so they don't evict the blocks searches use. See {@code MergeCachePolicy}. Dynamic, so it can be
+     * turned off without a restart.
+     */
+    public static final Setting<Boolean> MERGE_CACHE_BYPASS_ENABLED_SETTING = Setting
+        .boolSetting("node.store.crypto.merge_cache_bypass_enabled", true, Property.NodeScope, Property.Dynamic);
+
+    /**
      * Setting to use ByteBuffer-based IndexInput instead of MemorySegment-based.
      * When true, uses CachedByteBufferIndexInput with DirectByteBuffer and GC-managed lifecycle.
      * When false (default), uses CachedMemorySegmentIndexInput with Panama MemorySegment.
@@ -101,6 +109,9 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
      * Current value of the write cache enabled setting, updated dynamically via cluster settings.
      */
     private static volatile boolean writeCacheEnabled = true;
+
+    /** Current value of {@link #MERGE_CACHE_BYPASS_ENABLED_SETTING}, updated dynamically via cluster settings. */
+    private static volatile boolean mergeCacheBypassEnabled = true;
 
     private static volatile boolean byteBufferModeEnabled = false;
     private static volatile boolean byteBufferSlabPoolEnabled = false;
@@ -575,6 +586,7 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     public static void setNodeSettings(Settings settings) {
         nodeSettings = settings;
         writeCacheEnabled = WRITE_CACHE_ENABLED_SETTING.get(settings);
+        mergeCacheBypassEnabled = MERGE_CACHE_BYPASS_ENABLED_SETTING.get(settings);
         byteBufferModeEnabled = BYTE_BUFFER_MODE_ENABLED.get(settings);
         byteBufferSlabPoolEnabled = BYTE_BUFFER_SLAB_POOL_ENABLED.get(settings);
     }
@@ -603,6 +615,10 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
                 LOGGER.info("Updating write_cache_enabled to {}", value);
                 writeCacheEnabled = value;
             });
+            service.getClusterSettings().addSettingsUpdateConsumer(MERGE_CACHE_BYPASS_ENABLED_SETTING, value -> {
+                LOGGER.info("Updating merge_cache_bypass_enabled to {}", value);
+                mergeCacheBypassEnabled = value;
+            });
         }
     }
 
@@ -614,6 +630,15 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
      */
     public static boolean isWriteCacheEnabled() {
         return writeCacheEnabled;
+    }
+
+    /**
+     * Returns whether merge reads, read-once inputs and large writes are kept out of the block cache.
+     *
+     * @return true if the merge cache bypass is enabled
+     */
+    public static boolean isMergeCacheBypassEnabled() {
+        return mergeCacheBypassEnabled;
     }
 
     /**

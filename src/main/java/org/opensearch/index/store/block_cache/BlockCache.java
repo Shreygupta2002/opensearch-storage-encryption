@@ -31,6 +31,39 @@ public interface BlockCache<T> {
     BlockCacheValue<T> get(BlockCacheKey key);
 
     /**
+     * Returns the block if cached, or null, without counting a hit or miss and without making the entry
+     * less likely to be evicted. For one-pass readers, such as merges, that use a cached block when there
+     * is one but mustn't keep blocks in the cache.
+     *
+     * @param key the cache key identifying the block
+     * @return the cached block value, or null if not present
+     */
+    default BlockCacheValue<T> peek(BlockCacheKey key) {
+        return get(key);
+    }
+
+    /**
+     * Reads and decrypts {@code length} bytes (a multiple of the block size) from block-aligned
+     * {@code offset} of {@code filePath} into {@code dst}, without adding them to the cache.
+     *
+     * @return the number of bytes copied, fewer than {@code length} only at the end of the file
+     * @throws UnsupportedOperationException if this cache can't read outside itself
+     */
+    default int readUncached(Path filePath, long offset, byte[] dst, int dstOffset, int length) throws IOException {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " has no uncached reads");
+    }
+
+    /** Whether {@link #readUncached} is supported. */
+    default boolean supportsUncachedReads() {
+        return false;
+    }
+
+    /** The most blocks the cache holds, or -1 if it isn't bounded by a block count. */
+    default long maxBlocks() {
+        return -1;
+    }
+
+    /**
      * Returns the block, loading it via {@code BlockLoader} if absent.
      * 
      * @param key the cache key identifying the block
