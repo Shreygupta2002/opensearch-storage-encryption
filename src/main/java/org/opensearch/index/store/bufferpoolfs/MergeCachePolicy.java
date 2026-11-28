@@ -26,9 +26,12 @@ import org.opensearch.index.store.CryptoDirectoryFactory;
  * without adding the block to the cache. {@link IOContext#READONCE} inputs are treated the same way.</li>
  * <li><b>Writes.</b> The write cache keeps a plaintext copy of each written block so that new segments are
  * warm when searches reach them. For a merge whose estimated size is at least {@link #largeWriteBytes} of the
- * cache, nothing is cached: its output would only push out the blocks searches use. Every other file is
- * cached only up to that many bytes, which also bounds segment-replication copies, written with a
- * default context.</li>
+ * cache, nothing is cached: its output would only push out the blocks searches use. Nor is a file copied
+ * in from another shard copy by peer recovery or segment replication (the receiving node writes those
+ * chunks on the generic pool): it is written under a temporary name ({@code recovery.<id>.<name>},
+ * {@code replication.<id>.<name>}) and renamed when the copy completes, and the cache is keyed by path, so
+ * blocks cached while writing would never be read. Every other file is cached up to
+ * {@link #largeWriteBytes}.</li>
  * </ul>
  *
  * Enabled by {@code node.store.crypto.merge_cache_bypass_enabled} (default true, dynamic).
@@ -47,6 +50,7 @@ public final class MergeCachePolicy {
     private static final AtomicLong uncachedReads = new AtomicLong();
     private static final AtomicLong writeBlocksNotCached = new AtomicLong();
     private static final AtomicLong largeMergeOutputs = new AtomicLong();
+    private static final AtomicLong copyOutputs = new AtomicLong();
 
     private MergeCachePolicy() {}
 
@@ -69,7 +73,17 @@ public final class MergeCachePolicy {
      * {@link IOContext#DEFAULT}, so the context doesn't identify them). Searches run on the search pools.
      */
     static boolean isBulkReadThread(Thread thread) {
-        return isMergeThread(thread) || thread.getName().contains("[generic]");
+        return isMergeThread(thread) || isGenericThread(thread);
+    }
+
+    /**
+     * Whether {@code thread} is in OpenSearch's {@code generic} pool. On the sending node it reads files for
+     * peer recovery and segment replication; on the receiving node it writes the file chunks (the
+     * {@code recovery/file_chunk}, {@code replication/file_chunk} and {@code merged_segment_file_chunk}
+     * handlers all run there).
+     */
+    static boolean isGenericThread(Thread thread) {
+        return thread.getName().contains("[generic]");
     }
 
     /** Whether {@code thread} runs Lucene merges: a {@code ConcurrentMergeScheduler.MergeThread}. */
@@ -101,8 +115,9 @@ public final class MergeCachePolicy {
     }
 
     /**
-     * How many leading bytes of a file written with {@code context} may go into the write cache: none for a
-     * merge estimated at {@code largeWriteBytes} or more, otherwise {@code largeWriteBytes}.
+     * How many leading bytes of a file written with {@code context} on the current thread may go into the
+     * write cache: none for a merge estimated at {@code largeWriteBytes} or more or for a file copied in on
+     * the generic pool, otherwise {@code largeWriteBytes}.
      */
     static long writeCacheLimit(IOContext context, long largeWriteBytes) {
         if (enabled() == false) {
@@ -113,6 +128,10 @@ public final class MergeCachePolicy {
             && context.mergeInfo() != null
             && context.mergeInfo().estimatedMergeBytes() >= largeWriteBytes) {
             largeMergeOutputs.incrementAndGet();
+            return 0;
+        }
+        if (isGenericThread(Thread.currentThread())) {
+            copyOutputs.incrementAndGet();
             return 0;
         }
         return largeWriteBytes;
@@ -152,19 +171,25 @@ public final class MergeCachePolicy {
         return largeMergeOutputs.get();
     }
 
+    /** Files written on the generic pool (copied in from another shard copy), not write-cached. */
+    public static long copyOutputs() {
+        return copyOutputs.get();
+    }
+
     /** One-line summary for the periodic memory log. */
     public static String stats() {
         return String
             .format(
                 java.util.Locale.ROOT,
                 "MergeCacheBypass[enabled=%b, readBlocksFromCache=%d, readUncachedMB=%d, uncachedReads=%d, writeBlocksNotCached=%d, "
-                    + "largeMergeOutputs=%d]",
+                    + "largeMergeOutputs=%d, copyOutputs=%d]",
                 enabled(),
                 readBlocksFromCache.get(),
                 readBytesUncached.get() >> 20,
                 uncachedReads.get(),
                 writeBlocksNotCached.get(),
-                largeMergeOutputs.get()
+                largeMergeOutputs.get(),
+                copyOutputs.get()
             );
     }
 }

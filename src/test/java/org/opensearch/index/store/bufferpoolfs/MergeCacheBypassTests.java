@@ -371,6 +371,47 @@ public class MergeCacheBypassTests extends OpenSearchTestCase {
         assertEquals(bytes / CACHE_BLOCK_SIZE, cachedBlocks("recovered"));
     }
 
+    /** Writes the file on a new thread with the given name, as an OpenSearch pool thread would. */
+    private void writeFileOnThread(String threadName, String file, long bytes) throws Exception {
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        Thread t = new Thread(() -> {
+            try {
+                writeFile(file, IOContext.DEFAULT, bytes);
+            } catch (Throwable e) {
+                failure.set(e);
+            }
+        }, threadName);
+        t.start();
+        t.join();
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+    }
+
+    public void testFilesCopiedInOnTheGenericPoolAreNotWriteCached() throws Exception {
+        long bytes = (3 << 20) + 1234;
+        long copiesBefore = MergeCachePolicy.copyOutputs();
+        // How recovery writes a copied file: under a temporary name, renamed when the copy completes.
+        writeFileOnThread("opensearch[node-1][generic][T#5]", "recovery.abc._0.cfs", bytes);
+        assertEquals(0, cachedBlocks());
+        assertEquals(copiesBefore + 1, MergeCachePolicy.copyOutputs());
+        directory.rename("recovery.abc._0.cfs", "_0.cfs");
+        try (IndexInput in = directory.openInput("_0.cfs", IOContext.DEFAULT)) {
+            assertFileReadsBack(in, bytes);
+        }
+
+        // A file written on another pool, such as a flush, is write-cached as usual.
+        clearCache();
+        writeFileOnThread("opensearch[node-1][flush][T#1]", "flushed", bytes);
+        assertEquals(bytes / CACHE_BLOCK_SIZE + 1, cachedBlocks("flushed"));
+
+        // With the bypass off, the generic pool write-caches too.
+        clearCache();
+        setBypass(false);
+        writeFileOnThread("opensearch[node-1][generic][T#6]", "recovery.def._1.cfs", bytes);
+        assertEquals(bytes / CACHE_BLOCK_SIZE + 1, cachedBlocks("recovery.def._1.cfs"));
+    }
+
     public void testDefaultInputStillFillsCache() throws Exception {
         long bytes = 2 << 20;
         writeFile("search", IOContext.merge(new MergeInfo(1000, largeWriteBytes, false, 1)), bytes);
